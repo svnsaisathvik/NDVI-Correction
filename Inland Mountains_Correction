@@ -1,0 +1,367 @@
+// ===== NTSEC: Following Reference Code + Paper Verification =====
+// Location: 35.15°N, 118.95°E (Inland mountains - WORKING LOCATION)
+
+/* ========== 0) STUDY AREA + DATES ========== */
+var aoi = ee.Geometry.Rectangle([118.8, 35.0, 119.1, 35.3]);
+var baseStart = '2017-11-01'; 
+var baseEnd   = '2018-03-31';
+var verStart = '2017-04-01';   // Spring/summer for high sun
+var verEnd = '2020-06-30';
+Map.centerObject(aoi, 13);
+var deg2rad = Math.PI / 180;
+
+/* ========== 1) LOAD BASE IMAGE (Low Sun - Winter) ========== */
+print('===== BASE IMAGE (Low Sun - Winter) =====');
+
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+            .filterBounds(aoi)
+            .filterDate(baseStart, baseEnd)
+            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40))
+            .sort('CLOUDY_PIXEL_PERCENTAGE'); 
+
+var s2Size = s2.size();
+print('Base images found:', s2Size);
+
+var leastCloudy = ee.Algorithms.If(s2Size.gt(0), s2.first(), null);
+var hasImage = ee.Number(s2Size).gt(0);
+
+var sunZenith = ee.Number(ee.Algorithms.If(hasImage, ee.Image(leastCloudy).get('MEAN_SOLAR_ZENITH_ANGLE'), 0));
+var sunAzim = ee.Number(ee.Algorithms.If(hasImage, ee.Image(leastCloudy).get('MEAN_SOLAR_AZIMUTH_ANGLE'), 0));
+print('Sun Zenith:', sunZenith, '° (Paper: 39.26°)');
+print('Sun Azimuth:', sunAzim, '° (Paper: 148.12°)');
+
+var s2_img_raw = ee.Image(ee.Algorithms.If(hasImage, leastCloudy, ee.Image(0))).select(['B2', 'B3', 'B4', 'B8', 'SCL']);
+
+var scl = s2_img_raw.select('SCL');
+var cloudMask = ee.Algorithms.If(hasImage, 
+  scl.neq(3).and(scl.neq(8)).and(scl.neq(9)).and(scl.neq(10)),
+  ee.Image(0)
+);
+
+var reflectance = s2_img_raw.select(['B2', 'B3', 'B4', 'B8']).divide(10000).clamp(0, 1).updateMask(cloudMask);
+
+var rho_coastal = reflectance.select('B2').rename('B1');
+var rho_green = reflectance.select('B3');
+var rho_red = reflectance.select('B4');
+var rho_nir = reflectance.select('B8');
+
+/* ========== 2) DEM + TOPOGRAPHIC PARAMETERS ========== */
+var dem = ee.Image('USGS/SRTMGL1_003').clip(aoi);
+var terrain = ee.Terrain.products(dem);
+var slopeDeg = terrain.select('slope');
+
+var slope = slopeDeg.multiply(deg2rad);
+var aspect = terrain.select('aspect').multiply(deg2rad);
+
+var theta_z_rad = sunZenith.multiply(deg2rad);
+var theta_z = ee.Image.constant(theta_z_rad);
+var phi = ee.Image.constant(sunAzim.multiply(deg2rad));
+var sunElev = ee.Number(90).subtract(sunZenith);
+
+var cos_i = theta_z.cos().multiply(slope.cos())
+  .add(theta_z.sin().multiply(slope.sin())
+       .multiply(phi.subtract(aspect).cos()))
+  .rename('cos_i');
+
+/* ========== 3) SHADOW INDEX (SI) ========== */
+var numerator = rho_coastal.subtract(rho_green);
+var denominator = rho_coastal.add(rho_green).add(rho_nir.multiply(2)).add(1e-10);
+var SI = numerator.divide(denominator).rename('SI');
+
+/* ========== 4) ALPHA (Equation 18) ========== */
+var c = SI.sample({
+  region: aoi,
+  scale: 20,
+  numPixels: 8000,
+  seed: 42
+}).reduceColumns(ee.Reducer.percentile([50]), ['SI']).getNumber('p50').subtract(0.01);
+
+print('\nShadow Detection:');
+print('Threshold c:', c);
+
+var SI_max = SI.reduceRegion({reducer: ee.Reducer.max(), geometry: aoi, scale: 100, maxPixels: 1e9}).get('SI');
+var c_img = ee.Image.constant(c);
+var SI_max_img = ee.Image.constant(SI_max);
+
+var alpha = SI.subtract(c_img).divide(SI_max_img.subtract(c_img).add(1e-10)).where(SI.lt(c_img), 0).clamp(0, 1).rename('alpha');
+
+/* ========== 5) RADIATIVE TRANSFER TERMS ========== */
+var solar_constant = 1367; 
+var tau_atm = 0.75; 
+var diffuse_fraction = 0.18; 
+
+var E_d_t = ee.Image.constant(solar_constant * tau_atm);
+var E_d_h = E_d_t.multiply(theta_z.cos()); 
+var E_f_h = E_d_h.multiply(diffuse_fraction); 
+var E_h = E_d_h.add(E_f_h);
+
+var V_d = slope.cos().add(1).divide(2);
+var C_t = ee.Image(1).subtract(V_d);
+
+var rho_avg_red = rho_red.focal_mean(1);
+var rho_avg_nir = rho_nir.focal_mean(1);
+
+var E_f = E_f_h.multiply(V_d); 
+
+var E_a_red = E_h.multiply(C_t).multiply(rho_avg_red);
+var E_a_nir = E_h.multiply(C_t).multiply(rho_avg_nir);
+
+var E_shw_red = E_f.add(E_a_red).add(1e-6);
+var E_shw_nir = E_f.add(E_a_nir).add(1e-6);
+
+/* ========== 6) REFLECTANCE COMPENSATION ========== */
+var E_d_t_img = E_d_t; 
+
+var correction_ratio_red = E_d_t_img.divide(E_shw_red);
+var correction_ratio_nir = E_d_t_img.divide(E_shw_nir);
+
+var rho_dc_red = alpha.multiply(rho_red)
+    .multiply(correction_ratio_red)
+    .multiply(cos_i.clamp(0.2, 1)); 
+
+var rho_dc_nir = alpha.multiply(rho_nir)
+    .multiply(correction_ratio_nir);
+
+/* ========== 7) CORRECTED NDVI ========== */
+var NDVI_orig = rho_nir.subtract(rho_red).divide(rho_nir.add(rho_red).add(1e-10)).clamp(-1, 1).rename('NDVI_original');
+var rho_red_corr = rho_red.add(rho_dc_red);
+var rho_nir_corr = rho_nir.add(rho_dc_nir);
+var NDVI_corr = rho_nir_corr.subtract(rho_red_corr).divide(rho_nir_corr.add(rho_red_corr).add(1e-10)).clamp(-1, 1).rename('NDVI_corrected');
+
+/* ========== 8) SHADOW CLASSIFICATION ========== */
+var allShadows = SI.gte(c_img);
+var sunlit = allShadows.not();
+
+var sunElev_rad = ee.Image.constant(sunElev.multiply(deg2rad));
+var theta_si = slope.tan().multiply(-1).multiply(phi.subtract(aspect).cos()).atan();
+var selfShadowMask = theta_si.gte(sunElev_rad);
+var selfShadowOnly = allShadows.and(selfShadowMask).rename('Self_Shadow');
+var castShadow = allShadows.and(selfShadowMask.not()).rename('Cast_Shadow');
+
+function getStats(image, band, mask, label) {
+  var masked = image.select(band).updateMask(mask);
+  var stats = masked.reduceRegion({
+    reducer: ee.Reducer.mean().combine({reducer2: ee.Reducer.stdDev(), sharedInputs: true}),
+    geometry: aoi,
+    scale: 20,
+    maxPixels: 1e9,
+    bestEffort: true,
+    tileScale: 4
+  });
+  
+  var mean = ee.Number(stats.get(band + '_mean'));
+  var std = ee.Number(stats.get(band + '_stdDev'));
+  print(label + ' | Mean:', mean, '| Std:', std);
+  return {mean: mean, std: std};
+}
+
+print('\n===== NDVI STATISTICS (Table IV) =====');
+print('\n--- Sunny Slope (Sunlit) ---');
+getStats(NDVI_orig, 'NDVI_original', sunlit, 'Original');
+getStats(NDVI_corr, 'NDVI_corrected', sunlit, 'Corrected');
+
+print('\n--- Self Shadow ---');
+getStats(NDVI_orig, 'NDVI_original', selfShadowOnly, 'Original');
+getStats(NDVI_corr, 'NDVI_corrected', selfShadowOnly, 'Corrected');
+
+print('\n--- Cast Shadow ---');
+getStats(NDVI_orig, 'NDVI_original', castShadow, 'Original');
+getStats(NDVI_corr, 'NDVI_corrected', castShadow, 'Corrected');
+
+/* ========== 9) VERIFICATION IMAGE (High Sun - Like Paper's April Image) ========== */
+print('\n===== VERIFICATION IMAGE (High Sun) =====');
+
+var baseDate = ee.Date(ee.Image(leastCloudy).get('system:time_start'));
+print('Base image date:', baseDate.format('YYYY-MM-dd'));
+
+// Find verification image: Spring/Summer with LOW zenith (HIGH sun elevation)
+var s2_ver = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(aoi)
+  .filterDate(verStart, verEnd)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40))
+  .sort('MEAN_SOLAR_ZENITH_ANGLE');  // Low zenith = high sun
+
+var verSize = s2_ver.size();
+print('Verification candidates:', verSize);
+
+if (verSize.gt(0).getInfo()) {
+  var verImage = s2_ver.first();
+  var verSunZen = ee.Number(verImage.get('MEAN_SOLAR_ZENITH_ANGLE'));
+  var verDate = ee.Date(verImage.get('system:time_start'));
+  
+  print('Date:', verDate.format('YYYY-MM-dd'));
+  print('Sun Zenith:', verSunZen, '° (Paper: 62.60° - lower is better)');
+  print('Sun Elevation:', ee.Number(90).subtract(verSunZen), '°');
+  print('Zenith difference:', sunZenith.subtract(verSunZen), '° (should be POSITIVE)');
+  
+  // Compute verification NDVI (cloud masked)
+  var verScl = verImage.select('SCL');
+  var verCloudMask = verScl.neq(3).and(verScl.neq(8)).and(verScl.neq(9)).and(verScl.neq(10));
+  
+  var verRefl = verImage.select(['B4', 'B8']).divide(10000).updateMask(verCloudMask);
+  var NDVI_verif = verRefl.select('B8').subtract(verRefl.select('B4'))
+    .divide(verRefl.select('B8').add(verRefl.select('B4')).add(1e-10))
+    .clamp(-1, 1)
+    .rename('NDVI_verification');
+  
+  Map.addLayer(NDVI_verif, {min: 0.2, max: 0.9, palette: ['brown', 'yellow', 'green', 'darkgreen']}, 
+               'NDVI Verification (High Sun)', false);
+  
+  /* ========== VALIDATION METRICS (Table V & Figure 8) ========== */
+  function calcMetrics(pred, ref, mask, label) {
+    var valid = pred.mask().and(ref.mask()).and(mask);
+    var diff = pred.subtract(ref).updateMask(valid);
+    var diff_sq = diff.pow(2);
+    
+    var combined = diff.addBands(diff_sq);
+    var stats = combined.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: aoi,
+      scale: 20,
+      maxPixels: 1e9,
+      bestEffort: true,
+      tileScale: 4
+    });
+    
+    var bandName = pred.bandNames().get(0);
+    var bias = ee.Number(stats.get(bandName));
+    var mse = ee.Number(stats.get(ee.String(bandName).cat('_1')));
+    var rmse = mse.sqrt();
+    
+    print('\n--- ' + label + ' ---');
+    print('Bias:', bias);
+    print('RMSE:', rmse);
+    
+    return {bias: bias, rmse: rmse};
+  }
+  
+  // Paper uses vegetation areas with moderate slope
+  var vegThreshold = 0.3;  // Higher threshold for better validation
+  var validMask = NDVI_verif.gt(vegThreshold).and(slopeDeg.lt(50));
+  
+  print('\n===== VALIDATION METRICS (Table V) =====');
+  var m_orig = calcMetrics(NDVI_orig, NDVI_verif, validMask, 'Original vs Verification');
+  var m_corr = calcMetrics(NDVI_corr, NDVI_verif, validMask, 'NTSEC vs Verification');
+  
+  var rmse_improvement = m_orig.rmse.subtract(m_corr.rmse);
+  var bias_improvement = m_orig.bias.abs().subtract(m_corr.bias.abs());
+  
+  print('\n--- IMPROVEMENT (Paper expects positive values) ---');
+  print('RMSE reduction:', rmse_improvement, '(positive = better)');
+  print('Bias reduction:', bias_improvement, '(positive = better)');
+  
+  Export.image.toDrive({
+    image: NDVI_verif,
+    description: 'NTSEC_NDVI_Verification',
+    folder: 'NTSEC_Paper',
+    scale: 20,
+    region: aoi,
+    maxPixels: 1e13
+  });
+  
+  // Export scatter data for Figure 8 (density plots)
+  var verScatterData = NDVI_orig.addBands(NDVI_corr).addBands(NDVI_verif).updateMask(validMask);
+  
+  var verScatterSamples = verScatterData.sample({
+    region: aoi,
+    scale: 20,
+    numPixels: 5000,
+    seed: 42,
+    dropNulls: true,
+    geometries: false
+  });
+  
+  print('\nVerification scatter samples:', verScatterSamples.size());
+  
+  Export.table.toDrive({
+    collection: verScatterSamples,
+    description: 'NTSEC_Verification_Scatter',
+    folder: 'NTSEC_Paper',
+    fileNamePrefix: 'Verification_NDVI_Scatter',
+    fileFormat: 'CSV'
+  });
+  
+} else {
+  print('⚠️ No verification images found - adjust date range');
+}
+
+/* ========== 10) VISUALIZATION ========== */
+var ndviVis = {min: 0.2, max: 0.9, palette: ['blue', 'white', 'yellow', 'green', 'darkgreen']};
+var NDVI_diff = NDVI_corr.subtract(NDVI_orig).rename('NDVI_Difference');
+var diffVis = {min: 0, max: 0.15, palette: ['white', 'yellow', 'orange', 'red']}; 
+
+Map.addLayer(reflectance, {bands: ['B4', 'B3', 'B2'], min: 0, max: 0.3}, 'RGB', false);
+Map.addLayer(NDVI_orig, ndviVis, 'NDVI Original (Low Sun)', true);
+Map.addLayer(NDVI_corr, ndviVis, 'NDVI Corrected (NTSEC)', false);
+Map.addLayer(NDVI_diff.updateMask(allShadows), diffVis, 'NDVI Improvement', false);
+
+Map.addLayer(allShadows.updateMask(allShadows), {palette: ['000000']}, 'All Shadows', false);
+Map.addLayer(selfShadowOnly.updateMask(selfShadowOnly), {palette: ['FF1493']}, 'Self Shadow', false);
+Map.addLayer(castShadow.updateMask(castShadow), {palette: ['00CED1']}, 'Cast Shadow', false);
+
+var hillshade = ee.Terrain.hillshade(dem, sunAzim, sunElev);
+Map.addLayer(hillshade, {min: 0, max: 255}, 'Hillshade', false);
+
+/* ========== 11) SCATTER DATA EXPORT (Figure 13) ========== */
+print('\n=== COS(I) SCATTER DATA (Figure 13) ===');
+
+var scatterData = NDVI_orig.addBands(NDVI_corr).addBands(cos_i)
+  .addBands(selfShadowOnly.rename('is_self'))
+  .addBands(castShadow.rename('is_cast'))
+  .addBands(sunlit.rename('is_sunlit'));
+
+var classificationBand = sunlit.multiply(1).unmask(0)
+  .add(castShadow.multiply(2).unmask(0))
+  .add(selfShadowOnly.multiply(3).unmask(0))
+  .rename('Class');
+
+var scatterSamples = scatterData.addBands(classificationBand).stratifiedSample({
+  numPoints: 2000,
+  classBand: 'Class',
+  region: aoi,
+  scale: 20,
+  seed: 42,
+  dropNulls: true, 
+  geometries: false 
+});
+
+print('CosI scatter samples:', scatterSamples.size());
+
+Export.table.toDrive({
+  collection: scatterSamples,
+  description: 'NTSEC_CosI_Scatter_Data',
+  folder: 'NTSEC_Paper',
+  fileNamePrefix: 'NDVI_CosI_Scatter',
+  fileFormat: 'CSV'
+});
+
+/* ========== 12) IMAGE EXPORTS ========== */
+Export.image.toDrive({
+  image: NDVI_orig,
+  description: 'NTSEC_NDVI_Original',
+  folder: 'NTSEC_Paper',
+  scale: 20,
+  region: aoi,
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: NDVI_corr,
+  description: 'NTSEC_NDVI_Corrected',
+  folder: 'NTSEC_Paper',
+  scale: 20,
+  region: aoi,
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: NDVI_diff,
+  description: 'NTSEC_NDVI_Difference',
+  folder: 'NTSEC_Paper',
+  scale: 20,
+  region: aoi,
+  maxPixels: 1e13
+});
+
+print('\n✓ Script complete - Paper-style validation included');
+print('>>> Go to Tasks tab and RUN all export tasks <<<');
